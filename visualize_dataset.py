@@ -1,7 +1,9 @@
 import os
 import json
+import shutil
+import random
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk
 
 class ToolTip:
@@ -31,6 +33,47 @@ class ToolTip:
         if self.tipwindow:
             self.tipwindow.destroy()
         self.tipwindow = None
+
+class RatioDialog(tk.Toplevel):
+    """比例输入对话框"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("设置拆分比例")
+        self.geometry("300x200")
+        self.resizable(False, False)
+
+        tk.Label(self, text="训练比例 (默认70):").pack(pady=5)
+        self.train_var = tk.StringVar(value="70")
+        tk.Entry(self, textvariable=self.train_var).pack(pady=5)
+
+        tk.Label(self, text="验证比例 (默认20):").pack(pady=5)
+        self.valid_var = tk.StringVar(value="20")
+        tk.Entry(self, textvariable=self.valid_var).pack(pady=5)
+
+        tk.Label(self, text="测试比例 (默认10):").pack(pady=5)
+        self.test_var = tk.StringVar(value="10")
+        tk.Entry(self, textvariable=self.test_var).pack(pady=5)
+
+        tk.Button(self, text="确定", command=self.ok).pack(pady=10)
+        tk.Button(self, text="取消", command=self.destroy).pack()
+
+        self.result = None
+        self.grab_set()
+
+    def ok(self):
+        try:
+            train = float(self.train_var.get())
+            valid = float(self.valid_var.get())
+            test = float(self.test_var.get())
+            total = train + valid + test
+            if abs(total - 100) > 1e-6:
+                messagebox.showerror("错误", "比例之和必须为100")
+                return
+            self.result = (train/100, valid/100, test/100)
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的数字")
 
 class YOLOViewer:
     def __init__(self, root):
@@ -101,6 +144,12 @@ class YOLOViewer:
 
         self.btn_coco = tk.Button(top_frame, text="加载COCO数据集", command=self.load_coco_dataset)
         self.btn_coco.pack(side=tk.LEFT, padx=5)
+
+        self.btn_split = tk.Button(top_frame, text="拆分COCO", command=self.split_coco_dataset, state=tk.DISABLED)
+        self.btn_split.pack(side=tk.LEFT, padx=5)
+
+        self.btn_merge = tk.Button(top_frame, text="合并COCO", command=self.merge_coco_datasets)
+        self.btn_merge.pack(side=tk.LEFT, padx=5)
 
         self.lbl_info = tk.Label(top_frame, text="未加载数据集", anchor=tk.W)
         self.lbl_info.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
@@ -196,6 +245,7 @@ class YOLOViewer:
                     self.class_names[idx] = line.strip()
 
         self.mode = 'yolo'
+        self.btn_split.config(state=tk.DISABLED)
         self._update_listbox_and_display()
 
     # ==================== COCO 数据集加载 ====================
@@ -237,7 +287,7 @@ class YOLOViewer:
             })
             id_to_filename[img['id']] = img['file_name']
 
-        # 解析 annotations，按 image_id 分组，保留 segmentation 和 bbox
+        # 解析 annotations，按 image_id 分组
         self.coco_annotations = {}
         for ann in coco_data.get('annotations', []):
             img_id = ann['image_id']
@@ -245,8 +295,8 @@ class YOLOViewer:
                 self.coco_annotations[img_id] = []
             # 保留必要字段：segmentation, bbox, category_id
             self.coco_annotations[img_id].append({
-                'segmentation': ann.get('segmentation'),  # 可能为多边形列表或 RLE
-                'bbox': ann.get('bbox'),                  # [x, y, width, height]
+                'segmentation': ann.get('segmentation'),
+                'bbox': ann.get('bbox'),
                 'category_id': ann['category_id']
             })
 
@@ -272,7 +322,8 @@ class YOLOViewer:
             return
 
         self.mode = 'coco'
-        self.class_names = self.coco_categories  # 用于 get_color 等
+        self.class_names = self.coco_categories
+        self.btn_split.config(state=tk.NORMAL)
         self._update_listbox_and_display()
 
     # ==================== 公共更新方法 ====================
@@ -410,10 +461,8 @@ class YOLOViewer:
             seg = ann.get('segmentation')
             if seg and isinstance(seg, list) and len(seg) > 0:
                 # COCO segmentation 可以是多边形列表（每个多边形是一个点的列表）
-                # 格式：[[x1,y1,x2,y2,...], ...] 或对于 RLE 是 dict，这里忽略 RLE
                 for polygon in seg:
-                    if isinstance(polygon, list) and len(polygon) >= 6:  # 至少一个三角形
-                        # 将扁平的坐标列表转换为点对列表
+                    if isinstance(polygon, list) and len(polygon) >= 6:
                         points = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
                         self._draw_polygon(points, color, label_text, scale, offset_x, offset_y)
             elif ann.get('bbox'):
@@ -427,7 +476,6 @@ class YOLOViewer:
         """在画布上绘制多边形（轮廓）和类别标签"""
         if len(points) < 3:
             return
-        # 转换坐标到画布
         canvas_points = []
         min_x, min_y = float('inf'), float('inf')
         for (x, y) in points:
@@ -437,10 +485,7 @@ class YOLOViewer:
             if cx < min_x: min_x = cx
             if cy < min_y: min_y = cy
 
-        # 绘制多边形轮廓（不填充）
         self.canvas.create_polygon(canvas_points, outline=color, fill='', width=2)
-
-        # 在第一个点附近显示标签（或取最小x,y）
         self.canvas.create_text(
             min_x, min_y - 5,
             text=label_text, fill=color, anchor=tk.SW,
@@ -448,7 +493,7 @@ class YOLOViewer:
         )
 
     def _draw_rect(self, x1, y1, x2, y2, class_id, scale, offset_x, offset_y, label_text=None):
-        """在画布上绘制矩形和类别标签（用于YOLO或COCO后备）"""
+        """在画布上绘制矩形和类别标签"""
         x1_canvas = x1 * scale + offset_x
         y1_canvas = y1 * scale + offset_y
         x2_canvas = x2 * scale + offset_x
@@ -503,7 +548,7 @@ class YOLOViewer:
 
     def delete_selected(self, confirm=True):
         if self.mode == 'coco':
-            return  # 已在外层拦截，此处为安全
+            return
         selected_indices = self.listbox.curselection()
         if not selected_indices:
             messagebox.showinfo("提示", "没有选中任何图片")
@@ -559,6 +604,233 @@ class YOLOViewer:
             self.btn_next.config(state=tk.DISABLED)
             self.btn_delete.config(state=tk.DISABLED)
             self.current_index = -1
+
+    # ==================== 拆分 COCO 数据集 ====================
+    def split_coco_dataset(self):
+        if self.mode != 'coco' or not self.coco_images:
+            messagebox.showinfo("提示", "请先加载一个COCO数据集")
+            return
+
+        # 获取比例
+        dlg = RatioDialog(self.root)
+        self.root.wait_window(dlg)
+        if dlg.result is None:
+            return
+        train_ratio, valid_ratio, test_ratio = dlg.result
+
+        # 选择输出目录
+        out_dir = filedialog.askdirectory(title="选择输出目录")
+        if not out_dir:
+            return
+
+        # 准备数据
+        total = len(self.image_paths)
+        indices = list(range(total))
+        random.shuffle(indices)
+        train_end = int(total * train_ratio)
+        valid_end = train_end + int(total * valid_ratio)
+        train_indices = indices[:train_end]
+        valid_indices = indices[train_end:valid_end] if valid_ratio > 0 else []
+        test_indices = indices[valid_end:] if test_ratio > 0 else []
+
+        splits = {
+            'train': train_indices,
+            'valid': valid_indices,
+            'test': test_indices
+        }
+
+        for split_name, split_indices in splits.items():
+            if not split_indices:
+                continue
+
+            # 创建子目录
+            split_dir = os.path.join(out_dir, split_name)
+            images_dir = os.path.join(split_dir, 'images')
+            os.makedirs(images_dir, exist_ok=True)
+
+            # 收集该子集的图片ID和标注
+            split_image_ids = set()
+            split_images = []
+            split_annotations = []
+
+            # 建立原图片ID到新文件名的映射（如果重名冲突？这里不冲突，因为原文件名已唯一）
+            for idx in split_indices:
+                img_path = self.image_paths[idx]
+                fname = os.path.basename(img_path)
+                # 查找对应的图片信息
+                img_info = None
+                for info in self.coco_images:
+                    if info['file_name'] == fname:
+                        img_info = info
+                        break
+                if img_info is None:
+                    continue
+                img_id = img_info['id']
+                split_image_ids.add(img_id)
+                split_images.append(img_info.copy())  # 保留原ID
+                # 复制图片
+                dst_path = os.path.join(images_dir, fname)
+                shutil.copy2(img_path, dst_path)
+
+            # 收集标注
+            for img_id in split_image_ids:
+                anns = self.coco_annotations.get(img_id, [])
+                for ann in anns:
+                    split_annotations.append({
+                        'id': len(split_annotations) + 1,  # 新标注ID从1开始
+                        'image_id': img_id,
+                        'category_id': ann['category_id'],
+                        'bbox': ann['bbox'],
+                        'segmentation': ann['segmentation'],
+                        'area': ann['bbox'][2] * ann['bbox'][3] if ann.get('bbox') else 0,
+                        'iscrowd': 0
+                    })
+
+            # 构建新的COCO JSON
+            new_coco = {
+                'images': split_images,
+                'annotations': split_annotations,
+                'categories': [{'id': cid, 'name': name} for cid, name in self.coco_categories.items()]
+            }
+
+            # 保存JSON
+            json_path = os.path.join(split_dir, '_annotations.coco.json')
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(new_coco, f, indent=2)
+
+        messagebox.showinfo("完成", f"数据集拆分完成，已保存至 {out_dir}")
+
+    # ==================== 合并 COCO 数据集 ====================
+    def merge_coco_datasets(self):
+        # 选择多个JSON文件
+        json_paths = filedialog.askopenfilenames(
+            title="选择要合并的COCO JSON文件（可多选）",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not json_paths:
+            return
+
+        datasets = []
+        for jpath in json_paths:
+            # 为每个JSON询问图片文件夹
+            img_dir = filedialog.askdirectory(title=f"选择JSON对应的图片文件夹\n{jpath}")
+            if not img_dir:
+                return
+            try:
+                with open(jpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                datasets.append({
+                    'json_path': jpath,
+                    'img_dir': img_dir,
+                    'data': data
+                })
+            except Exception as e:
+                messagebox.showerror("错误", f"无法加载 {jpath}: {e}")
+                return
+
+        if not datasets:
+            return
+
+        # 选择输出目录
+        out_dir = filedialog.askdirectory(title="选择合并后数据集的输出目录")
+        if not out_dir:
+            return
+
+        # 创建 images 目录
+        images_out_dir = os.path.join(out_dir, 'images')
+        os.makedirs(images_out_dir, exist_ok=True)
+
+        # 类别合并：按名称合并
+        category_name_to_new_id = {}
+        new_categories = []
+        new_category_id = 1
+        # 同时记录每个数据集的旧类别ID到新类别ID的映射
+        old_to_new_cat_maps = []  # 每个元素是一个 dict
+
+        for ds in datasets:
+            cat_map = {}
+            for cat in ds['data'].get('categories', []):
+                name = cat['name']
+                if name not in category_name_to_new_id:
+                    category_name_to_new_id[name] = new_category_id
+                    new_categories.append({'id': new_category_id, 'name': name})
+                    new_category_id += 1
+                cat_map[cat['id']] = category_name_to_new_id[name]
+            old_to_new_cat_maps.append(cat_map)
+
+        # 图片合并：重新编号
+        new_images = []
+        new_annotations = []
+        new_image_id = 1
+        # 用于处理图片文件名冲突
+        used_filenames = set()
+
+        for ds_idx, ds in enumerate(datasets):
+            img_dir = ds['img_dir']
+            data = ds['data']
+            cat_map = old_to_new_cat_maps[ds_idx]
+
+            # 建立原图片ID到新图片ID的映射
+            old_img_id_to_new = {}
+
+            for img in data.get('images', []):
+                old_id = img['id']
+                fname = img['file_name']
+                # 检查文件名冲突
+                base, ext = os.path.splitext(fname)
+                new_fname = fname
+                counter = 1
+                while new_fname in used_filenames:
+                    new_fname = f"{base}_{counter}{ext}"
+                    counter += 1
+                used_filenames.add(new_fname)
+
+                # 复制图片
+                src_path = os.path.join(img_dir, fname)
+                dst_path = os.path.join(images_out_dir, new_fname)
+                if os.path.isfile(src_path):
+                    shutil.copy2(src_path, dst_path)
+                else:
+                    print(f"警告：图片不存在 {src_path}")
+
+                # 构建新图片信息
+                new_img = img.copy()
+                new_img['id'] = new_image_id
+                new_img['file_name'] = new_fname
+                new_images.append(new_img)
+
+                old_img_id_to_new[old_id] = new_image_id
+                new_image_id += 1
+
+            # 处理标注
+            for ann in data.get('annotations', []):
+                old_img_id = ann['image_id']
+                if old_img_id not in old_img_id_to_new:
+                    continue  # 图片可能未找到
+                new_ann = {
+                    'id': len(new_annotations) + 1,
+                    'image_id': old_img_id_to_new[old_img_id],
+                    'category_id': cat_map.get(ann['category_id'], 0),  # 映射后的类别ID
+                    'bbox': ann.get('bbox'),
+                    'segmentation': ann.get('segmentation'),
+                    'area': ann.get('area', 0),
+                    'iscrowd': ann.get('iscrowd', 0)
+                }
+                new_annotations.append(new_ann)
+
+        # 构建最终COCO JSON
+        merged_coco = {
+            'images': new_images,
+            'annotations': new_annotations,
+            'categories': new_categories
+        }
+
+        # 保存JSON
+        json_out = os.path.join(out_dir, '_annotations.coco.json')
+        with open(json_out, 'w', encoding='utf-8') as f:
+            json.dump(merged_coco, f, indent=2)
+
+        messagebox.showinfo("完成", f"合并完成！\n输出目录：{out_dir}\n总图片数：{len(new_images)}\n总标注数：{len(new_annotations)}")
 
 if __name__ == "__main__":
     root = tk.Tk()
